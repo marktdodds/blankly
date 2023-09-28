@@ -1,8 +1,8 @@
 # This runs all blankly Module Tests
 
-name: blankly Module Tests
+name: Blankly Module Tests
 
-on: [push, workflow_dispatch]
+on: [workflow_dispatch]
 
 jobs:
   build:

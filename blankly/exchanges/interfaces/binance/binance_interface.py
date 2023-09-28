@@ -17,7 +17,6 @@
 """
 import time
 
-import binance.exceptions
 import pandas as pd
 
 import blankly.utils.exceptions as exceptions
@@ -26,10 +25,15 @@ import blankly.utils.utils as utils
 from blankly.exchanges.interfaces.exchange_interface import ExchangeInterface
 from blankly.exchanges.orders.limit_order import LimitOrder
 from blankly.exchanges.orders.market_order import MarketOrder
+from blankly.exchanges.orders.stop_loss import StopLossOrder
+from blankly.exchanges.orders.take_profit import TakeProfitOrder
 
 
 class BinanceInterface(ExchangeInterface):
+    _asset_precision: dict
+
     def __init__(self, exchange_name, authenticated_api):
+        self._asset_precision = {}
         # Initialize this as None so that it can be filled & cached when needed
         self.__available_currencies = None
         super().__init__(exchange_name, authenticated_api, valid_resolutions=[60, 180, 300, 900, 1800, 3600, 7200,
@@ -37,14 +41,16 @@ class BinanceInterface(ExchangeInterface):
                                                                               604800, 2592000])
 
     def init_exchange(self):
+        import binance.exceptions
         try:
             self.calls.get_account()
-        except binance.exceptions.BinanceAPIException:
-            raise exceptions.APIException("Invalid API Key, IP, or permissions for action - are you trying "
+        except binance.exceptions.BinanceAPIException as e:
+            raise exceptions.APIException(f"Debugging info: {e} - {e.response} - {e.message}\n"
+                                          "Invalid API Key, IP, or permissions for action - are you trying "
                                           "to use your normal exchange keys while in sandbox mode? "
                                           "\nTry toggling the \'sandbox\' setting in your keys.json, check "
                                           "if the keys were input correctly into your keys.json or ensure you have set "
-                                          "the correct binance_tld in settings.json.")
+                                          "the correct binance_tld in settings.json.\n")
 
         symbols = self.calls.get_exchange_info()["symbols"]
         assets = []
@@ -248,6 +254,23 @@ class BinanceInterface(ExchangeInterface):
                 })
         return utils.AttributeDict(parsed_dictionary)
 
+    def _fix_response(self, needed, response):
+        response['side'] = response['side'].lower()
+        response['type'] = response['type'].lower()
+        response['status'] = super().homogenize_order_status('binance', response['status'].lower())
+        response['symbol'] = utils.to_blankly_symbol(response['symbol'], 'binance')
+        if 'transactTime' in response:
+            response["transactTime"] /= 1000
+        response = utils.rename_to([
+            ["orderId", "id"],
+            ["transactTime", "created_at"],
+            ["origQty", "size"],
+            ["timeInForce", "time_in_force"],
+            ["cummulativeQuoteQty", "funds"]
+        ], response)
+        response = utils.isolate_specific(needed, response)
+        return response
+
     @utils.order_protection
     def market_order(self, symbol, side, size) -> MarketOrder:
         """
@@ -303,13 +326,8 @@ class BinanceInterface(ExchangeInterface):
             ]
         }
         """
-        renames = [
-            ["orderId", "id"],
-            ["transactTime", "created_at"],
-            ["origQty", "size"],
-            ["timeInForce", "time_in_force"],
-            ["cummulativeQuoteQty", "funds"]
-        ]
+        if self.should_auto_trunc:
+            size = utils.trunc(size, self.get_asset_precision(symbol))
         order = {
             'size': size,
             'side': side,
@@ -320,14 +338,7 @@ class BinanceInterface(ExchangeInterface):
         # The interface here will be the query of order status from this object, because orders are dynamic
         # creatures
         response = self.calls.order_market(symbol=modified_symbol, side=side, quantity=size)
-        response['side'] = response['side'].lower()
-        response['type'] = response['type'].lower()
-        response['status'] = super().homogenize_order_status('binance', response['status'].lower())
-        response["transactTime"] = response["transactTime"] / 1000
-        response['symbol'] = utils.to_blankly_symbol(response['symbol'], 'binance',
-                                                     quote_guess=utils.get_quote_asset(symbol))
-        response = utils.rename_to(renames, response)
-        response = utils.isolate_specific(needed, response)
+        response = self._fix_response(needed, response)
         return MarketOrder(order, response, self)
 
     @utils.order_protection
@@ -373,6 +384,8 @@ class BinanceInterface(ExchangeInterface):
         BinanceOrderUnknownSymbolException, BinanceOrderInactiveSymbolException
 
         """
+        if self.should_auto_trunc:
+            size = utils.trunc(size, self.get_asset_precision(symbol))
         order = {
             'size': size,
             'side': side,
@@ -382,19 +395,120 @@ class BinanceInterface(ExchangeInterface):
         }
         modified_symbol = utils.to_exchange_symbol(symbol, 'binance')
         response = self.calls.order_limit(symbol=modified_symbol, side=side, price=price, quantity=size)
-        renames = [
-            ["orderId", "id"],
-            ["transactTime", "created_at"],
-            ["origQty", "size"],
-            ["timeInForce", "time_in_force"],
-        ]
-        response['side'] = response['side'].lower()
-        response['type'] = response['type'].lower()
-        response['status'] = super().homogenize_order_status('binance', response['status'].lower())
-        response['symbol'] = utils.to_blankly_symbol(response['symbol'], 'binance')
-        response = utils.rename_to(renames, response)
-        response = utils.isolate_specific(needed, response)
+        response = self._fix_response(needed, response)
         return LimitOrder(order, response, self)
+
+    @utils.order_protection
+    def take_profit_order(self, symbol, price, size) -> TakeProfitOrder:
+        """
+        Used for sending take profit orders
+        Args:
+            symbol: currency to sell
+            price: price to sell at
+            size: amount of currency (like BTC)
+        """
+        needed = self.needed['take_profit']
+        """Send in a new take-profit order
+
+        Any order with an icebergQty MUST have timeInForce set to GTC.
+
+        :param symbol: required
+        :type symbol: str
+        :param side: required
+        :type side: str
+        :param quantity: required
+        :type quantity: decimal
+        :param price: required
+        :type price: str
+        :param timeInForce: default Good till cancelled
+        :type timeInForce: str
+        :param newClientOrderId: A unique id for the order. Automatically generated if not sent.
+        :type newClientOrderId: str
+        :param icebergQty: Used with LIMIT, STOP_LOSS_LIMIT, and TAKE_PROFIT_LIMIT to create an iceberg order.
+        :type icebergQty: decimal
+        :param newOrderRespType: Set the response JSON. ACK, RESULT, or FULL; default: RESULT.
+        :type newOrderRespType: str
+        :param recvWindow: the number of milliseconds the request is valid for
+        :type recvWindow: int
+
+        :returns: API response
+
+        See order endpoint for full response options
+
+        :raises: BinanceRequestException, BinanceAPIException, BinanceOrderException, BinanceOrderMinAmountException,
+        BinanceOrderMinPriceException, BinanceOrderMinTotalException,
+        BinanceOrderUnknownSymbolException, BinanceOrderInactiveSymbolException
+
+        """
+        side = 'sell'
+        order = {
+            'size': size,
+            'side': side,
+            'price': price,
+            'symbol': symbol,
+            'type': 'take_profit'
+        }
+        modified_symbol = utils.to_exchange_symbol(symbol, 'binance')
+        response = self.calls.create_order(symbol=modified_symbol, side=side, stopPrice=price, quantity=size,
+                                           type='TAKE_PROFIT')
+        response = self._fix_response(needed, response)
+        return TakeProfitOrder(order, response, self)
+
+    @utils.order_protection
+    def stop_loss_order(self, symbol, price, size) -> StopLossOrder:
+        """
+        Used for sending stop loss orders
+        Args:
+            symbol: currency to sell
+            price: price to sell at
+            size: amount of currency (like BTC)
+        """
+        needed = self.needed['stop_loss']
+        """Send in a new stop-loss order
+
+        Any order with an icebergQty MUST have timeInForce set to GTC.
+
+        :param symbol: required
+        :type symbol: str
+        :param side: required
+        :type side: str
+        :param quantity: required
+        :type quantity: decimal
+        :param price: required
+        :type price: str
+        :param timeInForce: default Good till cancelled
+        :type timeInForce: str
+        :param newClientOrderId: A unique id for the order. Automatically generated if not sent.
+        :type newClientOrderId: str
+        :param icebergQty: Used with LIMIT, STOP_LOSS_LIMIT, and TAKE_PROFIT_LIMIT to create an iceberg order.
+        :type icebergQty: decimal
+        :param newOrderRespType: Set the response JSON. ACK, RESULT, or FULL; default: RESULT.
+        :type newOrderRespType: str
+        :param recvWindow: the number of milliseconds the request is valid for
+        :type recvWindow: int
+
+        :returns: API response
+
+        See order endpoint for full response options
+
+        :raises: BinanceRequestException, BinanceAPIException, BinanceOrderException, BinanceOrderMinAmountException,
+        BinanceOrderMinPriceException, BinanceOrderMinTotalException,
+        BinanceOrderUnknownSymbolException, BinanceOrderInactiveSymbolException
+
+        """
+        side = 'sell'
+        order = {
+            'size': size,
+            'side': side,
+            'price': price,
+            'symbol': symbol,
+            'type': 'stop_loss'
+        }
+        modified_symbol = utils.to_exchange_symbol(symbol, 'binance')
+        response = self.calls.create_order(symbol=modified_symbol, side=side, stopPrice=price, quantity=size,
+                                           type='STOP_LOSS')
+        response = self._fix_response(needed, response)
+        return StopLossOrder(order, response, self)
 
     def cancel_order(self, symbol, order_id) -> dict:
         """Cancel an active order. Either orderId or origClientOrderId must be sent.
@@ -586,7 +700,10 @@ class BinanceInterface(ExchangeInterface):
         Returns:
             Dataframe with *at least* 'time (epoch)', 'low', 'high', 'open', 'close', 'volume' as columns.
         """
+        return self._binance_get_product_history(self.calls, symbol, epoch_start, epoch_stop, resolution)
 
+    @staticmethod
+    def _binance_get_product_history(calls, symbol, epoch_start, epoch_stop, resolution):
         resolution = blankly.time_builder.time_interval_to_seconds(resolution)
 
         # epoch_start, epoch_stop = super().get_product_history(symbol, epoch_start, epoch_stop, resolution)
@@ -632,9 +749,9 @@ class BinanceInterface(ExchangeInterface):
         while need > 1000:
             # Close is always 300 points ahead
             window_close = int(window_open + 1000 * resolution)
-            history = history + self.calls.get_klines(symbol=symbol, startTime=window_open * 1000,
-                                                      endTime=window_close * 1000, interval=gran_string,
-                                                      limit=1000)
+            history = history + calls.get_klines(symbol=symbol, startTime=window_open * 1000,
+                                                 endTime=window_close * 1000, interval=gran_string,
+                                                 limit=1000)
 
             window_open = window_close
             need -= 1000
@@ -642,9 +759,9 @@ class BinanceInterface(ExchangeInterface):
             utils.update_progress((initial_need - need) / initial_need)
 
         # Fill the remainder
-        history_block = history + self.calls.get_klines(symbol=symbol, startTime=window_open * 1000,
-                                                        endTime=epoch_stop * 1000, interval=gran_string,
-                                                        limit=1000)
+        history_block = history + calls.get_klines(symbol=symbol, startTime=window_open * 1000,
+                                                   endTime=epoch_stop * 1000, interval=gran_string,
+                                                   limit=1000)
 
         data_frame = pd.DataFrame(history_block, columns=['time', 'open', 'high', 'low', 'close', 'volume',
                                                           'close time', 'quote asset volume', 'number of trades',
@@ -683,6 +800,9 @@ class BinanceInterface(ExchangeInterface):
     def get_order_filter(self, symbol):
         """
         Optimally we'll just remove the filter section and make the returns accurate
+
+
+        FOR THE US EXCHANGE:
         {
             "symbol": "BTCUSD",
             "status": "TRADING",
@@ -741,8 +861,141 @@ class BinanceInterface(ExchangeInterface):
                 {"filterType": "MAX_NUM_ALGO_ORDERS", "maxNumAlgoOrders": 5},
             ],
             "permissions": ["SPOT"],
+        }
+
+
+        FOR THE INTERNATIONAL EXCHANGE:
+        {
+          "symbol": "ETHUSDT",
+          "status": "TRADING",
+          "baseAsset": "ETH",
+          "baseAssetPrecision": 8,
+          "quoteAsset": "USDT",
+          "quotePrecision": 8,
+          "quoteAssetPrecision": 8,
+          "baseCommissionPrecision": 8,
+          "quoteCommissionPrecision": 8,
+          "orderTypes": [
+            "LIMIT",
+            "LIMIT_MAKER",
+            "MARKET",
+            "STOP_LOSS_LIMIT",
+            "TAKE_PROFIT_LIMIT"
+          ],
+          "icebergAllowed": true,
+          "ocoAllowed": true,
+          "quoteOrderQtyMarketAllowed": false,
+          "allowTrailingStop": true,
+          "cancelReplaceAllowed": true,
+          "isSpotTradingAllowed": true,
+          "isMarginTradingAllowed": true,
+          "filters": [
+            {
+              "filterType": "PRICE_FILTER",
+              "minPrice": "0.01000000",
+              "maxPrice": "1000000.00000000",
+              "tickSize": "0.01000000"
+            },
+            {
+              "filterType": "LOT_SIZE",
+              "minQty": "0.00010000",
+              "maxQty": "9000.00000000",
+              "stepSize": "0.00010000"
+            },
+            {
+              "filterType": "ICEBERG_PARTS",
+              "limit": 10
+            },
+            {
+              "filterType": "MARKET_LOT_SIZE",
+              "minQty": "0.00000000",
+              "maxQty": "2575.21545313",
+              "stepSize": "0.00000000"
+            },
+            {
+              "filterType": "TRAILING_DELTA",
+              "minTrailingAboveDelta": 10,
+              "maxTrailingAboveDelta": 2000,
+              "minTrailingBelowDelta": 10,
+              "maxTrailingBelowDelta": 2000
+            },
+            {
+              "filterType": "PERCENT_PRICE_BY_SIDE",
+              "bidMultiplierUp": "5",
+              "bidMultiplierDown": "0.2",
+              "askMultiplierUp": "5",
+              "askMultiplierDown": "0.2",
+              "avgPriceMins": 5
+            },
+            {
+              "filterType": "NOTIONAL",
+              "minNotional": "10.00000000",
+              "applyMinToMarket": true,
+              "maxNotional": "9000000.00000000",
+              "applyMaxToMarket": false,
+              "avgPriceMins": 5
+            },
+            {
+              "filterType": "MAX_NUM_ORDERS",
+              "maxNumOrders": 200
+            },
+            {
+              "filterType": "MAX_NUM_ALGO_ORDERS",
+              "maxNumAlgoOrders": 5
+            }
+          ],
+          "permissions": [
+            "SPOT",
+            "MARGIN",
+            "TRD_GRP_004",
+            "TRD_GRP_005",
+            "TRD_GRP_006",
+            "TRD_GRP_009",
+            "TRD_GRP_010",
+            "TRD_GRP_011",
+            "TRD_GRP_012",
+            "TRD_GRP_013"
+          ],
+          "defaultSelfTradePreventionMode": "NONE",
+          "allowedSelfTradePreventionModes": [
+            "NONE",
+            "EXPIRE_TAKER",
+            "EXPIRE_MAKER",
+            "EXPIRE_BOTH"
+          ]
         },
         """
+        us_filter_mapping = {
+            'PRICE_FILTER': 0,
+            'PERCENT_PRICE': 1,
+            'LOT_SIZE': 2,
+            'MIN_NOTIONAL': 3,
+            'ICEBERG_PARTS': 4,
+            'MARKET_LOT_SIZE': 5,
+            'TRAILING_DELTA': 6,
+            'MAX_NUM_ORDERS': 7,
+            'MAX_NUM_ALGO_ORDERS': 8
+        }
+
+        international_filter_mapping = {
+            'PRICE_FILTER': 0,
+            'LOT_SIZE': 1,
+            'ICEBERG_PARTS': 2,
+            'MARKET_LOT_SIZE': 3,
+            'TRAILING_DELTA': 4,
+            'PERCENT_PRICE_BY_SIDE': 5,
+            'NOTIONAL': 6,
+            'MAX_NUM_ORDERS': 7,
+            'MAX_NUM_ALGO_ORDERS': 8
+        }
+
+        def is_international_exchange(asset_dict: dict) -> bool:
+            """
+            Given the dictionary for the asset, tell if it is an international exchange
+            """
+            filters_ = asset_dict['filters']
+
+            return filters_[1]['filterType'] == 'LOT_SIZE'
 
         converted_symbol = utils.to_exchange_symbol(symbol, 'binance')
         current_price = None
@@ -752,30 +1005,49 @@ class BinanceInterface(ExchangeInterface):
                 symbol_data = i
                 current_price = float(self.calls.get_avg_price(symbol=converted_symbol)['price'])
                 break
+
+
         if current_price is None:
             raise LookupError("Specified market not found")
 
+        using_international_exchange = is_international_exchange(symbol_data)
+        if using_international_exchange:
+            filter_mapping = international_filter_mapping
+        else:
+            filter_mapping = us_filter_mapping
+
         filters = symbol_data["filters"]
-        hard_min_price = float(filters[0]["minPrice"])
-        hard_max_price = float(filters[0]["maxPrice"])
-        quote_increment = float(filters[0]["tickSize"])
+        hard_min_price = float(filters[filter_mapping['PRICE_FILTER']]["minPrice"])
+        hard_max_price = float(filters[filter_mapping['PRICE_FILTER']]["maxPrice"])
+        quote_increment = float(filters[filter_mapping['PRICE_FILTER']]["tickSize"])
 
-        percent_min_price = float(filters[1]["multiplierDown"]) * current_price
-        percent_max_price = float(filters[1]["multiplierUp"]) * current_price
+        # This is the only one where the keys are different
+        if using_international_exchange:
+            # TODO technically this multiplier is different for buy and sell sides, this should be reflected in the
+            #  backtesting engine
+            multiplier_up = float(filters[filter_mapping['PERCENT_PRICE_BY_SIDE']]["bidMultiplierUp"])
+            multiplier_down = float(filters[filter_mapping['PERCENT_PRICE_BY_SIDE']]["bidMultiplierDown"])
+        else:
+            multiplier_up = float(filters[filter_mapping['PERCENT_PRICE']]["multiplierUp"])
+            multiplier_down = float(filters[filter_mapping['PERCENT_PRICE']]["multiplierDown"])
 
-        min_quantity = float(filters[2]["minQty"])
-        max_quantity = float(filters[2]["maxQty"])
-        base_increment = float(filters[2]["stepSize"])
+        percent_min_price = multiplier_down * current_price
+        percent_max_price = multiplier_up * current_price
 
-        min_market_notational = float(filters[3]['minNotional'])
-        max_market_notational = 92233720368.547752  # For some reason equal to the first *11 digits* of 2^63 then
-        # it gets weird past the decimal
+        min_quantity = float(filters[filter_mapping['LOT_SIZE']]["minQty"])
+        max_quantity = float(filters[filter_mapping['LOT_SIZE']]["maxQty"])
+        base_increment = float(filters[filter_mapping['LOT_SIZE']]["stepSize"])
+
+        if using_international_exchange:
+            min_market_notational = float(filters[filter_mapping['NOTIONAL']]['minNotional'])
+            max_market_notational = float(filters[filter_mapping['NOTIONAL']]['maxNotional'])
+        else:
+            min_market_notational = float(filters[filter_mapping['MIN_NOTIONAL']]['minNotional'])
+            max_market_notational = 92233720368.547752  # For some reason equal to the first *11 digits* of 2^63 then
+                                                        # it gets weird past the decimal
 
         # Must test both nowadays
-        try:
-            max_orders = int(filters[7]["maxNumOrders"])
-        except KeyError:
-            max_orders = int(filters[6]["maxNumOrders"])
+        max_orders = int(filters[filter_mapping['MAX_NUM_ORDERS']]["maxNumOrders"])
 
         if percent_min_price < hard_min_price:
             min_price = hard_min_price
@@ -820,8 +1092,8 @@ class BinanceInterface(ExchangeInterface):
                 },
             },
             "exchange_specific": {
-                'limit_multiplier_up': float(filters[1]["multiplierUp"]),
-                'limit_multiplier_down': float(filters[1]["multiplierDown"])
+                'limit_multiplier_up': multiplier_up,
+                'limit_multiplier_down': multiplier_down
             }
         }
 

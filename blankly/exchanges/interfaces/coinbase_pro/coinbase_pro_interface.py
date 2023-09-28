@@ -26,6 +26,8 @@ from blankly.exchanges.interfaces.exchange_interface import ExchangeInterface
 from blankly.exchanges.orders.limit_order import LimitOrder
 from blankly.exchanges.orders.market_order import MarketOrder
 from blankly.exchanges.orders.stop_limit import StopLimit
+from blankly.exchanges.orders.stop_loss import StopLossOrder
+from blankly.exchanges.orders.take_profit import TakeProfitOrder
 from blankly.utils.exceptions import APIException, InvalidOrder
 
 
@@ -36,7 +38,7 @@ class CoinbaseProInterface(ExchangeInterface):
     def init_exchange(self):
         # This is purely an authentication check which can be disabled in settings
         # Coinbase is symbol agnostic so passing a blank here is okay
-        fees = self.calls.get_fees(None)
+        fees = self.calls.get_fees()
         try:
             if fees['message'] == "Invalid API Key":
                 raise LookupError("Invalid API Key - are you trying to use your normal exchange keys "
@@ -159,18 +161,11 @@ class CoinbaseProInterface(ExchangeInterface):
             'settled': False
         }
         """
-        order = {
-            'size': size,
-            'side': side,
-            'symbol': symbol,
-            'type': 'market'
-        }
+        if self.should_auto_trunc:
+            size = utils.trunc(size, self.get_asset_precision(symbol))
+        order = utils.build_order_info(0, side, size, symbol, 'market')
         response = self.calls.place_market_order(symbol, side, size=size)
-        if "message" in response:
-            raise InvalidOrder("Invalid Order: " + response["message"])
-        response["created_at"] = utils.epoch_from_iso8601(response["created_at"])
-        response["symbol"] = response.pop('product_id')
-        response = utils.isolate_specific(needed, response)
+        response = self._fix_response(needed, response)
         return MarketOrder(order, response, self)
 
     @utils.order_protection
@@ -203,20 +198,91 @@ class CoinbaseProInterface(ExchangeInterface):
             "settled": false
         }
         """
-        order = {
-            'size': size,
-            'side': side,
-            'price': price,
-            'symbol': symbol,
-            'type': 'limit'
-        }
+        if self.should_auto_trunc:
+            size = utils.trunc(size, self.get_asset_precision(symbol))
+        order = utils.build_order_info(price, side, size, symbol, 'limit')
         response = self.calls.place_limit_order(symbol, side, price, size=size)
+        response = self._fix_response(needed, response)
+        return LimitOrder(order, response, self)
+
+    @staticmethod
+    def _fix_response(needed, response):
         if "message" in response:
             raise InvalidOrder("Invalid Order: " + response["message"])
         response["created_at"] = utils.epoch_from_iso8601(response["created_at"])
         response["symbol"] = response.pop('product_id')
         response = utils.isolate_specific(needed, response)
-        return LimitOrder(order, response, self)
+        return response
+
+    @utils.order_protection
+    def take_profit_order(self, symbol, price, size) -> TakeProfitOrder:
+        """
+        Used for placing a take-profit orders
+        Args:
+            symbol: currency to sell
+            price: price to sell at
+            size: amount of currency (like BTC)
+        """
+        needed = self.needed['take_profit']
+        """
+        {
+            "id": "d0c5340b-6d6c-49d9-b567-48c4bfca13d2",
+            "price": "0.10000000",
+            "size": "0.01000000",
+            "product_id": "BTC-USD",
+            "side": "buy",
+            "stp": "dc",
+            "type": "limit",
+            "time_in_force": "GTC",
+            "post_only": false,
+            "created_at": "2016-12-08T20:02:28.53864Z",
+            "fill_fees": "0.0000000000000000",
+            "filled_size": "0.00000000",
+            "executed_value": "0.0000000000000000",
+            "status": "pending",
+            "settled": false
+        }
+        """
+        side = 'sell'
+        order = utils.build_order_info(price, side, size, symbol, 'take_profit')
+        response = self.calls.place_limit_order(symbol, side, price, size=size)
+        response = self._fix_response(needed, response)
+        return TakeProfitOrder(order, response, self)
+
+    @utils.order_protection
+    def stop_loss_order(self, symbol, price, size) -> StopLossOrder:
+        """
+        Used for placing a stop-loss order
+        Args:
+            symbol: currency to sell
+            price: price to sell at
+            size: amount of currency (like BTC)
+        """
+        needed = self.needed['stop_loss']
+        """
+        {
+            "id": "d0c5340b-6d6c-49d9-b567-48c4bfca13d2",
+            "price": "0.10000000",
+            "size": "0.01000000",
+            "product_id": "BTC-USD",
+            "side": "buy",
+            "stp": "dc",
+            "type": "limit",
+            "time_in_force": "GTC",
+            "post_only": false,
+            "created_at": "2016-12-08T20:02:28.53864Z",
+            "fill_fees": "0.0000000000000000",
+            "filled_size": "0.00000000",
+            "executed_value": "0.0000000000000000",
+            "status": "pending",
+            "settled": false
+        }
+        """
+        side = 'sell'
+        order = utils.build_order_info(price, side, size, symbol, 'stop_loss')
+        response = self.calls.place_stop_order(symbol, side, price=price, size=size)
+        response = self._fix_response(needed, response)
+        return StopLossOrder(order, response, self)
 
     """
     Stop limit isn't added to the abstract class because the binance version is barely supported.
@@ -261,7 +327,7 @@ class CoinbaseProInterface(ExchangeInterface):
         order = {
             'symbol': symbol,
             'side': side,
-            'type': 'stop',
+            'type': 'stop_loss',
             'stop': stop,
             'stop_price': stop_price,
             'size': size,
@@ -530,9 +596,13 @@ class CoinbaseProInterface(ExchangeInterface):
         if products is None:
             raise LookupError("Specified market not found")
 
-        base_min_size = float(products.pop('base_min_size'))
-        base_max_size = float(products.pop('base_max_size'))
-        base_increment = float(products.pop('base_increment'))
+        base_min_size = float(products.pop('base_increment'))
+        # Coinbase removed base_max_size
+        base_max_size = float(100000000000000000)
+        base_increment = float(base_min_size)
+
+        min_market_funds = products['min_market_funds']
+        max_market_funds = 1000000000 # big number approach
 
         return {
             "symbol": products.pop('id'),
@@ -559,12 +629,12 @@ class CoinbaseProInterface(ExchangeInterface):
                 "quote_increment": float(products.pop('quote_increment')),  # Specifies the min order price as well
                 # as the price increment.
                 "buy": {
-                    "min_funds": float(products['min_market_funds']),
-                    "max_funds": float(products['max_market_funds']),
+                    "min_funds": float(min_market_funds),
+                    "max_funds": float(max_market_funds),
                 },
                 "sell": {
-                    "min_funds": float(products.pop('min_market_funds')),
-                    "max_funds": float(products.pop('max_market_funds')),
+                    "min_funds": float(min_market_funds),
+                    "max_funds": float(max_market_funds),
                 },
             },
             "exchange_specific": {**products}

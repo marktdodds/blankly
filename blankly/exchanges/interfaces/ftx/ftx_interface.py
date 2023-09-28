@@ -16,7 +16,6 @@
     along with this program.  If not, see <https://www.gnu.org/licenses/>.
 """
 
-
 import pandas as pd
 import time
 from blankly.exchanges.interfaces.exchange_interface import ExchangeInterface
@@ -26,6 +25,9 @@ from blankly.exchanges.interfaces.ftx.ftx_api import FTXAPI
 import blankly.utils.utils as utils
 import copy
 from typing import List
+
+from blankly.exchanges.orders.stop_loss import StopLossOrder
+from blankly.exchanges.orders.take_profit import TakeProfitOrder
 
 
 class FTXInterface(ExchangeInterface):
@@ -205,20 +207,15 @@ class FTXInterface(ExchangeInterface):
             size: desired amount of base asset to use
         """
         needed = self.needed['market_order']
+        if self.should_auto_trunc:
+            size = utils.trunc(size, self.get_asset_precision(symbol))
 
+        # TODO pretty sure this needs to convert the symbol to an 'FTX' symbol before sending it off to the api
         response = self.get_calls().place_order(symbol, side, None, size, order_type="market")
 
-        response["symbol"] = utils.to_blankly_symbol(response.pop("market"), 'ftx')
-        response["created_at"] = utils.epoch_from_iso8601(response.pop("createdAt"))
+        response = self._fix_response(needed, response, False)
 
-        response = utils.isolate_specific(needed, response)
-
-        order = {
-            'size': size,
-            'side': side,
-            'symbol': symbol,
-            'type': 'market'
-        }
+        order = utils.build_order_info(0, side, size, symbol, 'market')
 
         return MarketOrder(order, response, self)
 
@@ -275,23 +272,70 @@ class FTXInterface(ExchangeInterface):
             price: price to set limit order
             size: amount of asset (like BTC) for the limit to be valued
         """
-        needed = self.needed['limit_order']
+        needed = self.needed['take_profit']
         response = self.get_calls().place_order(symbol, side, price, size, order_type="limit")
+        if self.should_auto_trunc:
+            size = utils.trunc(size, self.get_asset_precision(symbol))
+        order = utils.build_order_info(price, side, size, symbol, 'take_profit')
 
-        order = {
-            'size': size,
-            'side': side,
-            'price': price,
-            'symbol': symbol,
-            'type': 'limit'
-        }
-
-        response["symbol"] = utils.to_blankly_symbol(response.pop("market"), 'ftx')
-        response["created_at"] = utils.epoch_from_iso8601(response.pop("createdAt"))
-        response["time_in_force"] = "GTC"
-        response = utils.isolate_specific(needed, response)
+        response = self._fix_response(needed, response)
 
         return LimitOrder(order, response, self)
+
+    @staticmethod
+    def _fix_response(needed, response, set_tif=True):
+        response["symbol"] = utils.to_blankly_symbol(response.pop("market"), 'ftx')
+        response["created_at"] = utils.epoch_from_iso8601(response.pop("createdAt"))
+        if set_tif:
+            response["time_in_force"] = "GTC"
+        response = utils.isolate_specific(needed, response)
+        return response
+
+    @utils.order_protection
+    def stop_loss_order(self,
+                        symbol: str,
+                        price: float,
+                        size: float) -> StopLossOrder:
+        """
+        Used for placing a stop-loss order
+        Args:
+            symbol: asset to buy
+            price: price to sell at
+            size: amount of asset (like BTC)
+        """
+        needed = self.needed['stop_loss']
+        side = 'sell'
+        response = self.get_calls().place_conditional_order(symbol, side, size, order_type="stop",
+                                                            trigger_price=price)
+
+        order = utils.build_order_info(price, side, size, symbol, 'stop_loss')
+
+        response = self._fix_response(needed, response)
+
+        return StopLossOrder(order, response, self)
+
+    @utils.order_protection
+    def take_profit_order(self,
+                          symbol: str,
+                          price: float,
+                          size: float) -> TakeProfitOrder:
+        """
+        Used for placing a take-profit order
+        Args:
+            symbol: asset to buy
+            price: price to sell at
+            size: amount of asset (like BTC)
+        """
+        needed = self.needed['limit_order']
+        side = 'sell'
+        response = self.get_calls().place_conditional_order(symbol, side, size, order_type="takeProfit",
+                                                            trigger_price=price)
+
+        order = utils.build_order_info(price, side, size, symbol, 'take_profit')
+
+        response = self._fix_response(needed, response)
+
+        return TakeProfitOrder(order, response, self)
 
     def cancel_order(self, symbol: str, order_id: str) -> dict:
         """
@@ -433,9 +477,13 @@ class FTXInterface(ExchangeInterface):
         Returns:
             Dataframe with *at least* 'time (epoch)', 'low', 'high', 'open', 'close', 'volume' as columns.
         """
+        return self.ftx_product_history(self.get_calls(), symbol, epoch_start, epoch_stop, resolution)
 
-        if "-" in symbol:
-            symbol = symbol.replace("-", "/")
+    @staticmethod
+    def ftx_product_history(api, symbol, epoch_start, epoch_stop, resolution):
+        # TODO this is probably the wrong place to put this code
+        # shared binance history code needs to be refactored as well
+        symbol = symbol.replace("-", "/")
 
         # epoch_start, epoch_stop = super().get_product_history(symbol, epoch_start, epoch_stop, resolution)
         epoch_start = utils.convert_epochs(epoch_start)
@@ -462,7 +510,7 @@ class FTXInterface(ExchangeInterface):
             # Close is always 1500 points ahead
             window_close = window_open + 1500 * resolution
 
-            response = self.get_calls().get_product_history(symbol, window_open, window_close, resolution)
+            response = api.get_product_history(symbol, window_open, window_close, resolution)
 
             history = history + response
 
@@ -473,7 +521,7 @@ class FTXInterface(ExchangeInterface):
 
         # Fill the remainder
         window_close = epoch_stop
-        response = self.get_calls().get_product_history(symbol, window_open, window_close, resolution)
+        response = api.get_product_history(symbol, window_open, window_close, resolution)
         history_block = history + response
         # print(history_block)
         history_block.sort(key=lambda x: x["time"])
@@ -534,7 +582,7 @@ class FTXInterface(ExchangeInterface):
 
         return {
             "symbol": utils.to_blankly_symbol(market_info["name"], 'ftx'),  # make function in utils (or static)
-                                                                            # to switch slash to dash
+            # to switch slash to dash
             "base_asset": market_info["baseCurrency"],
             "quote_asset": market_info["quoteCurrency"],
             "max_orders": 99999999,

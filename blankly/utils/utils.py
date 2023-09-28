@@ -21,16 +21,12 @@ import json
 import sys
 import decimal
 import os
-from datetime import datetime as dt, timezone
-from math import ceil, trunc as math_trunc
+from datetime import datetime as dt
+from math import trunc as math_trunc
 from typing import Union
 
-import dateutil.parser as dp
 import numpy as np
 import pandas as pd
-import pandas_market_calendars as mcal
-
-from blankly.utils.time_builder import time_interval_to_seconds
 
 # Copy of settings to compare defaults vs overrides
 default_general_settings = {
@@ -38,6 +34,9 @@ default_general_settings = {
         "use_sandbox_websockets": False,
         "websocket_buffer_size": 10000,
         "test_connectivity_on_auth": True,
+        "auto_truncate": False,
+        "global_shorting": False,
+        "simulate_margin": True,
 
         "coinbase_pro": {
             "cash": "USD"
@@ -46,6 +45,25 @@ default_general_settings = {
             "cash": "USDT",
             "binance_tld": "us"
         },
+        "binance_futures": {
+            "cash": "USDT",
+            "margin_type": "USDT-M"
+        },
+        "alpaca": {
+            "websocket_stream": "iex",
+            "cash": "USD",
+            "enable_shorting": True,
+            "use_yfinance": False
+        },
+        "oanda": {
+            "cash": "USD"
+        },
+        "okx": {
+            "cash": "USDT"
+        },
+        "keyless": {
+            "cash": "USD"
+        },
         "kucoin": {
             "cash": "USDT"
         },
@@ -53,17 +71,12 @@ default_general_settings = {
             "cash": "USD",
             "ftx_tld": "us"
         },
-        "alpaca": {
-            "websocket_stream": "iex",
+        "ftx_futures": {
             "cash": "USD",
-            "enable_shorting": True,
-            "use_yfinance": False,
+            "ftx_tld": "com"
         },
-        "oanda": {
-            "cash": "USD"
-        },
-        "keyless": {
-            "cash": "USD"
+        "paper": {
+              "price_source": "api"
         }
     }
 }
@@ -83,24 +96,24 @@ default_backtest_settings = {
         "continuous_caching": True,
         "resample_account_value_for_metrics": "1d",
         "quote_account_value_in": "USD",
-        "ignore_user_exceptions": False,
+        "ignore_user_exceptions": True,
         "risk_free_return_rate": 0.0,
         "benchmark_symbol": None
     }
 }
 
 default_notify_settings = {
-  "email": {
-    "port": 465,
-    "smtp_server": "smtp.website.com",
-    "sender_email": "email_attached_to_smtp_account@web.com",
-    "receiver_email": "email_to_send_to@web.com",
-    "password": "my_password"
-  },
-  "text": {
-    "phone_number": "1234567683",
-    "provider": "verizon"
-  }
+    "email": {
+        "port": 465,
+        "smtp_server": "smtp.website.com",
+        "sender_email": "email_attached_to_smtp_account@web.com",
+        "receiver_email": "email_to_send_to@web.com",
+        "password": "my_password"
+    },
+    "text": {
+        "phone_number": "1234567683",
+        "provider": "verizon"
+    }
 }
 
 default_deploy_settings = {
@@ -108,7 +121,7 @@ default_deploy_settings = {
     "python_version": '3.7',
     "requirements": "./requirements.txt",
     "working_directory": ".",
-    "ignore_files": ['price_caches'],
+    "ignore_files": ['price_caches', '.git', '.idea', '.vscode'],
     "backtest_args": {
         'to': '1y'
     },
@@ -164,7 +177,7 @@ class __BlanklySettings:
                     user_settings[k] = v
         return user_settings
 
-    def load(self, override_path=None) -> dict:
+    def load(self, override_path=None, override_allow_nonexistent=False) -> dict:
         # Make overrides sticky by changing how the default is set. This is cool because the user can put settings in
         # obscure locations and then continue to load from them
         if override_path is not None:
@@ -174,7 +187,7 @@ class __BlanklySettings:
             try:
                 preferences = load_json_file(self.__default_path)
             except FileNotFoundError:
-                if self.__allow_nonexistent:
+                if self.__allow_nonexistent or override_allow_nonexistent:
                     return self.__default_settings
                     # self.write(self.__default_settings)
                     # # Recursively run this
@@ -216,12 +229,12 @@ deployment_settings = __BlanklySettings('./blankly.json', default_deploy_setting
                                         "working directory!", allow_nonexistent=True)
 
 
-def load_user_preferences(override_path=None) -> dict:
-    return general_settings.load(override_path)
+def load_user_preferences(override_path=None, override_allow_nonexistent=False) -> dict:
+    return general_settings.load(override_path, override_allow_nonexistent=override_allow_nonexistent)
 
 
-def load_backtest_preferences(override_path=None) -> dict:
-    return backtest_settings.load(override_path)
+def load_backtest_preferences(override_path=None, override_allow_nonexistent=False) -> dict:
+    return backtest_settings.load(override_path, override_allow_nonexistent=override_allow_nonexistent)
 
 
 def load_deployment_settings() -> dict:
@@ -247,6 +260,7 @@ def pretty_print_json(json_object, actually_print=True):
 
 
 def epoch_from_iso8601(iso8601: str) -> float:
+    import dateutil.parser as dp
     return dp.parse(iso8601).timestamp()
 
 
@@ -262,6 +276,7 @@ def convert_input_to_epoch(value: Union[str, dt]) -> float:
 
 def iso8601_from_epoch(epoch) -> str:
     return dt.utcfromtimestamp(epoch).isoformat() + 'Z'
+
 
 # Removed due to sklearn dependency
 # def get_price_derivative(ticker, point_number):
@@ -331,6 +346,8 @@ def to_blankly_symbol(symbol, exchange, quote_guess=None) -> str:
     if exchange == "ftx":
         return symbol.replace("/", "-")
 
+    return symbol
+
 
 def __check_ending(full_string, checked_ending) -> bool:
     check_length = len(checked_ending)
@@ -346,6 +363,7 @@ def to_exchange_symbol(blankly_symbol, exchange):
         return blankly_symbol
     if exchange == 'ftx' or exchange == "kraken":
         return blankly_symbol.replace("-", "/")
+    return blankly_symbol
 
 
 def get_base_asset(symbol):
@@ -379,6 +397,8 @@ def rename_to(keys_array, renaming_dictionary):
         mutated_dictionary["exchange_specific"] = {}
 
     for i in keys_array:
+        if i[0] not in renaming_dictionary:
+            continue
         if i[1] in renaming_dictionary:
             # If we're here this key has already been defined, push it to the specific
             mutated_dictionary["exchange_specific"][i[1]] = renaming_dictionary[i[1]]
@@ -426,7 +446,8 @@ def isolate_specific(needed, compare_dictionary):
 
     # Now we need to remove the keys that we appended to exchange_specific
     for k, v in exchange_specific.items():
-        del compare_dictionary[k]
+        if k in compare_dictionary:
+            del compare_dictionary[k]
 
     # If there exists the exchange specific dict in the compare dictionary
     # This is done because after renaming, if there are naming conflicts they will already have been pushed here
@@ -645,39 +666,6 @@ def ceil_date(date, **kwargs):
     return dt.fromtimestamp(date.timestamp() + secs - date.timestamp() % secs)
 
 
-OVERESTIMATE_CONSTANT = 1.5
-
-
-def get_estimated_start_from_limit(limit, end_epoch, resolution_str, resolution_multiplier):
-
-    nyse = mcal.get_calendar('NYSE')
-    required_length = ceil(limit * OVERESTIMATE_CONSTANT)
-    resolution = time_interval_to_seconds(resolution_str)
-
-    if resolution == 60 and limit < (1440 / resolution_multiplier):
-        return end_epoch - 4 * 86400  # worst case is three day weekend at 9:30am open
-
-    if resolution == 3600 and limit < (24 / resolution_multiplier):
-        return end_epoch - 4 * 86400  # worst case is three day weekend at 9:30am open
-
-    temp_start = end_epoch - limit * resolution * resolution_multiplier
-    end_date = dt.fromtimestamp(end_epoch, tz=timezone.utc)
-    start_date = dt.fromtimestamp(temp_start, tz=timezone.utc)
-
-    schedule = nyse.schedule(start_date=start_date, end_date=end_date)
-    date_range = mcal.date_range(schedule, frequency='1D')
-
-    count = 1
-    while len(date_range) < required_length:
-        temp_start -= 3600 * OVERESTIMATE_CONSTANT * count
-        start_date = dt.fromtimestamp(temp_start)
-        schedule = nyse.schedule(start_date=start_date, end_date=end_date)
-        date_range = mcal.date_range(schedule, frequency='1D')
-        count += 1
-
-    return temp_start
-
-
 class AttributeDict(dict):
     """
     This is adds functions to the dictionary class, no other modifications. This gives dictionaries abilities like:
@@ -687,6 +675,7 @@ class AttributeDict(dict):
     Basically you can get and set attributes with a dot instead of [] - like dict.available rather than
      dict['available']
     """
+
     def __getattr__(self, attr):
         # Try catch is wrapped to support copying objects
         try:
@@ -732,6 +721,7 @@ class Email:
     Object wrapper for simplifying interaction with SMTP servers & the blankly.reporter.email function.
     Alternatively a notify.json can be created which automatically integrates with blankly.reporter.email()
     """
+
     def __init__(self, smtp_server: str, sender_email: str, password: str, port: int = 465):
         """
         Create the email wrapper:
@@ -757,7 +747,7 @@ class Email:
                                receiver_email=receiver_email, password=self.__password, port=self.__port)
 
 
-def count_decimals(number) -> int:
+def count_decimals(number: float) -> int:
     """
     Count the number of decimals in a given float: 1.4335 -> 4 or 3 -> 0
     """
@@ -783,11 +773,13 @@ def enforce_base_asset(func):
     Used for get_account functions, this enforces that the user is always getting the base asset which is probably
     what the user meant
     """
+
     def wrapper(self, symbol=None):
         # Get the base asset if it was defined
         if symbol is not None:
             symbol = get_base_asset(symbol)
         return func(self, symbol=symbol)
+
     return wrapper
 
 
@@ -795,10 +787,12 @@ def order_protection(func):
     """
     Decorator to provide protection against live orders inside backtest environment
     """
+
     def wrapper(*args, **kwargs):
         if blankly._backtesting:
             raise Exception("Blocked attempt at live order inside backtesting environment")
         return func(*args, **kwargs)
+
     return wrapper
 
 
@@ -827,9 +821,48 @@ def increment_to_precision(increment: float) -> int:
     return math.floor(-math.log10(increment))
 
 
+def precision_to_increment(precision: int) -> float:
+    return 10 ** (-precision)
+
+
 def trim_df_time_column(df, epoch_start: [int, float], epoch_stop: [int, float]):
     df = df[df['time'] >= epoch_start]
     df = df[df['time'] <= epoch_stop]
 
     return df
 
+
+def aggregate_prices_by_resolution(price_dict, symbol_, resolution_, data_) -> dict:
+    if symbol_ not in price_dict:
+        price_dict[symbol_] = {}
+    # Concat after the resolution check here
+    if resolution_ not in price_dict[symbol_]:
+        price_dict[symbol_][resolution_] = data_
+    else:
+        price_dict[symbol_][resolution_] = pd.concat([price_dict[symbol_][resolution_],
+                                                      data_])
+    return price_dict
+
+
+def extract_price_by_resolution(prices, symbol, epoch_start, epoch_stop, resolution):
+    if symbol in prices:
+        if resolution in prices[symbol]:
+            price_set = prices[symbol][resolution]
+        else:
+            raise LookupError(f"The resolution {resolution} not found or downloaded for {symbol}.")
+    else:
+        raise LookupError(f"Prices for this symbol ({symbol}) not found")
+
+    return trim_df_time_column(price_set, epoch_start - resolution, epoch_stop)
+
+
+def build_order_info(price, side, size, symbol, type_) -> dict:
+    order = {
+        'size': size,
+        'side': side,
+        'symbol': symbol,
+        'type': type_
+    }
+    if price:
+        order['price'] = price
+    return order

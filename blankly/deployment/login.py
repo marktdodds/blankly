@@ -30,7 +30,6 @@ SUCCESS_URL = 'https://firebasestorage.googleapis.com/v0/b/blankly-6ada5.appspot
 FAILURE_URL = 'https://firebasestorage.googleapis.com/v0/b/blankly-6ada5.appspot.com/o/login_failure.html?alt=media&token=b2d9f6dc-aa54-4da2-aa6f-1f75a4025634'
 
 
-
 def write_token(token):
     token_file = get_token_file()
     token_file.parent.mkdir(parents=True, exist_ok=True)
@@ -65,8 +64,6 @@ def poll_login() -> Optional[API]:
         api = API(token)
         write_token(token)
         return api
-
-
 
 
 def get_token() -> Optional[str]:
@@ -105,4 +102,8 @@ def get_datadir() -> pathlib.Path:
 
 
 def logout():
-    get_token_file().unlink(missing_ok=True)
+    # python 3.8 has a parameter for this `missing_ok` but we need to support 3.7
+    try:
+        get_token_file().unlink()
+    except FileNotFoundError:
+        pass

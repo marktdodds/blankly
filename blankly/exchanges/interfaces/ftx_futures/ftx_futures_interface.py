@@ -21,6 +21,7 @@ from typing import Optional
 
 from blankly.enums import MarginType, HedgeMode, Side, PositionMode, TimeInForce, ContractType, OrderStatus, OrderType
 from blankly.exchanges.interfaces.ftx.ftx_api import FTXAPI
+from blankly.exchanges.interfaces.ftx.ftx_interface import FTXInterface
 from blankly.exchanges.interfaces.futures_exchange_interface import FuturesExchangeInterface
 from blankly.exchanges.orders.futures.futures_order import FuturesOrder
 from blankly.utils import utils, time_builder
@@ -33,7 +34,7 @@ class FTXFuturesInterface(FuturesExchangeInterface):
 
     @staticmethod
     def to_exchange_symbol(symbol: str):
-        base_asset, quote_asset = symbol.split('-')
+        base_asset, quote_asset = symbol.split('-', 1)
         if quote_asset != 'USD':
             raise ValueError('invalid symbol')
         return base_asset + '-PERP'  # only perpetual contracts right now
@@ -103,31 +104,32 @@ class FTXFuturesInterface(FuturesExchangeInterface):
             if '-PERP' not in prod['name']:
                 continue  # only perpetual contracts for now
             symbol = prod['underlying'] + '-USD'
-            products[symbol] = utils.AttributeDict({
+            products[symbol] = {
                 'symbol': symbol,
                 'base_asset': prod['underlying'],
                 'quote_asset': 'USD',
                 'contract_type': ContractType.PERPETUAL,
-                'price_precision': self.increment_to_precision(
+                'price_precision': utils.increment_to_precision(
                     prod['priceIncrement']),
-                'size_precision': self.increment_to_precision(
+                'size_precision': utils.increment_to_precision(
                     prod['sizeIncrement']),
                 'exchange_specific': prod
-            })
+            }
         if filter:
             return products[filter]
         return products
 
-    def get_account(self, filter: str = None) -> utils.AttributeDict:
+    def get_account(self, filter: str = None) -> dict:
         balances = self.calls.get_balances()
         coins = self.calls.get_coins()
-        accounts = utils.AttributeDict({
-            coin['id']: utils.AttributeDict({
+        accounts = {
+            coin['id']: {
                 'available': 0.0,
+                'hold': 0.0,  # TODO
                 'exchange_specific': coin
-            })
+            }
             for coin in coins
-        })
+        }
 
         for bal in balances:
             coin = bal['coin']
@@ -142,7 +144,7 @@ class FTXFuturesInterface(FuturesExchangeInterface):
             return accounts[filter]
         return accounts
 
-    def get_positions(self, filter: str = None) -> Optional[dict]:
+    def get_position(self, filter: str = None) -> Optional[dict]:
         leverage = self.get_leverage()
 
         res = self.calls.get_positions()
@@ -152,17 +154,12 @@ class FTXFuturesInterface(FuturesExchangeInterface):
             size = float(position['netSize'])
             if size == 0:
                 continue
-            positions[symbol] = utils.AttributeDict({
+            positions[symbol] = {
                 'size': size,
                 'position': PositionMode.BOTH,
-                'entry_price': float(position['entryPrice']),
                 'contract_type': ContractType.PERPETUAL,
-                'leverage': leverage,
-                'margin_type': MarginType.CROSSED,
-                'unrealized_pnl': float(
-                    position['unrealizedPnl']),  # TODO not sure on this one
                 'exchange_specific': position
-            })
+            }
 
         if filter:
             return positions.get(filter, None)
@@ -211,7 +208,7 @@ class FTXFuturesInterface(FuturesExchangeInterface):
                                      ioc=ioc)
         return self.parse_order_response(res)
 
-    def take_profit(
+    def take_profit_order(
             self,
             symbol: str,
             side: Side,
@@ -229,12 +226,12 @@ class FTXFuturesInterface(FuturesExchangeInterface):
                                                  trigger_price=price)
         return self.parse_order_response(res)
 
-    def stop_loss(self,
-                  symbol: str,
-                  side: Side,
-                  price: float,
-                  size: float,
-                  position: PositionMode = PositionMode.BOTH) -> FuturesOrder:
+    def stop_loss_order(self,
+                        symbol: str,
+                        side: Side,
+                        price: float,
+                        size: float,
+                        position: PositionMode = PositionMode.BOTH) -> FuturesOrder:
         symbol = self.to_exchange_symbol(symbol)
         if position != PositionMode.BOTH:
             raise ValueError(
@@ -256,7 +253,7 @@ class FTXFuturesInterface(FuturesExchangeInterface):
         return HedgeMode.ONEWAY
 
     @utils.order_protection
-    def set_leverage(self, leverage: int, symbol: str = None):
+    def set_leverage(self, leverage: float, symbol: str = None):
         if symbol:
             raise Exception(
                 'FTX Futures does not allow setting leverage per symbol. Use interface.set_leverage(leverage) to set '
@@ -306,9 +303,9 @@ class FTXFuturesInterface(FuturesExchangeInterface):
         # TODO dedup binance_futures_exchange maybe?
         history = []
         resolution = self.get_funding_rate_resolution()
-        LIMIT = 500
+        limit = 500
         window_start = epoch_start
-        window_end = epoch_start + LIMIT * resolution
+        window_end = epoch_start + limit * resolution
 
         response = True
         while response:
@@ -316,13 +313,13 @@ class FTXFuturesInterface(FuturesExchangeInterface):
                                                     symbol)
 
             history.extend({
-                'rate': float(e['rate']),
-                'time': self.parse_timestamp(e['time'])
-            } for e in response)
+                               'rate': float(e['rate']),
+                               'time': self.parse_timestamp(e['time'])
+                           } for e in response)
 
             if response:
                 window_start = window_end
-                window_end = min(epoch_stop, window_start + LIMIT * resolution)
+                window_end = min(epoch_stop, window_start + limit * resolution)
 
         return sorted(history, key=operator.itemgetter('time'))
 
@@ -330,6 +327,12 @@ class FTXFuturesInterface(FuturesExchangeInterface):
         return time_builder.build_hour()
 
     def get_product_history(self, symbol, epoch_start, epoch_stop, resolution):
+        return FTXInterface.ftx_product_history(self.calls,self.to_exchange_symbol(symbol), epoch_start, epoch_stop, resolution)
+    def get_maker_fee(self) -> float:
         raise NotImplementedError
 
+    def get_taker_fee(self) -> float:
+        raise NotImplementedError
 
+    def get_funding_rate(self, symbol: str) -> float:
+        raise NotImplementedError

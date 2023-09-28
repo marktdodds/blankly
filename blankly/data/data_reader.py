@@ -20,7 +20,16 @@ import json
 import pandas as pd
 from enum import Enum
 
-from . import DataTypes
+from blankly.utils import convert_epochs
+from blankly.exchanges.interfaces.futures_exchange_interface import FuturesExchangeInterface
+
+
+class DataTypes(Enum):
+    ohlcv_csv = 0
+    tick_csv = 1
+    ohlcv_json = 2
+    event_json = 3
+
 
 """
 This class seeks to solve these problems:
@@ -33,9 +42,10 @@ This class seeks to solve these problems:
 class FileTypes(Enum):
     csv = 'csv'
     json = 'json'
+    df = 'df'
 
 
-class __DataReader:
+class DataReader:
     @staticmethod
     def _check_length(df: pd.DataFrame, identifier: str):
         try:
@@ -65,7 +75,7 @@ class __DataReader:
         self.price_data: bool = self.__is_price_data(data_type)
 
 
-class __FormatReader(__DataReader):
+class __FormatReader(DataReader):
     def __init__(self, data_type):
         super().__init__(data_type)
 
@@ -75,18 +85,36 @@ class __FormatReader(__DataReader):
         Primarily for CSV prices, this allows single or multi sets of symbols to be converted into matching arrays
         """
         # Turn it into a list
-        if isinstance(file_path, str):
+        if isinstance(file_path, str) or isinstance(file_path, pd.DataFrame):
             file_paths = [file_path]
         else:
             file_paths = file_path
 
-        if isinstance(symbol, str):
+        if isinstance(symbol, str) or isinstance(file_path, pd.DataFrame):
             symbols = [symbol]
         else:
             # Could be None still
             symbols = symbol
 
         return file_paths, symbols
+
+    def _parse_df_prices(self, file_paths: list, symbols: list, columns: set) -> None:
+
+        if symbols is None:
+            raise LookupError("Must pass one or more symbols to identify the DataFrame")
+        if len(file_paths) != len(symbols):
+            raise LookupError(f"Mismatching symbol & file path lengths, got {len(file_paths)} and {len(symbols)} for "
+                              f"file paths and symbol lengths.")
+
+        for index in range(len(file_paths)):
+
+            self._check_length(file_paths[index], file_paths[index])
+
+            # Check if its contained
+            assert (columns.issubset(file_paths[index].columns))
+
+            # Now push it directly into the dataset and sort by time
+            self._internal_dataset[symbols[index]] = file_paths[index].sort_values('time')
 
     def _parse_csv_prices(self, file_paths: list, symbols: list, columns: set) -> None:
         if symbols is None:
@@ -134,7 +162,9 @@ class PriceReader(__FormatReader):
                 raise LookupError("Cannot pass both csv files and json files into a single constructor.")
 
         for file_path in file_paths:
-            if file_path[-3:] == 'csv':
+            if isinstance(file_path, pd.DataFrame):
+                complain_if_different('df', FileTypes.df.value)
+            elif file_path[-3:] == 'csv':
                 complain_if_different('csv', FileTypes.csv.value)
             elif file_path[-4:] == 'json':
                 # In this instance the symbols should be None
@@ -148,18 +178,29 @@ class PriceReader(__FormatReader):
         for symbol in self._internal_dataset:
             # Get the time diff
             time_series: pd.Series = self._internal_dataset[symbol]['time']
+
+            # Convert all epochs using the convert epoch function
+            time_series = time_series.apply(lambda x: convert_epochs(x))
+
             time_dif = time_series.diff()
 
             # Now find the most common difference and use that
             if symbol not in self.prices_info:
                 self.prices_info[symbol] = {}
 
+            guessed_resolution = int(time_dif.value_counts().idxmax())
+
+            # If the resolution is 0, then we have a problem
+            if guessed_resolution == 0:
+                raise LookupError(f"Resolution is 0 for {symbol}, this is not allowed. Please check your data."
+                                  f" This commonly occurs when the data is in exponential format or too few datapoints")
+
             # Store the resolution start time and end time of each dataset
             self.prices_info[symbol]['resolution'] = int(time_dif.value_counts().idxmax())
             self.prices_info[symbol]['start_time'] = time_series.iloc[0]
             self.prices_info[symbol]['stop_time'] = time_series.iloc[-1]
 
-    def __init__(self, file_path: [str, list], symbol: [str, list] = None):
+    def __init__(self, file_path: [str, list], symbol: [str, list]):
         """
         Read in a new custom price dataset in either json or csv format
 
@@ -178,7 +219,7 @@ class PriceReader(__FormatReader):
         self.prices_info = {}
 
         try:
-            assert(len(symbols) == len(set(symbols)))
+            assert (len(symbols) == len(set(symbols)))
         except AssertionError:
             raise AssertionError("Cannot use duplicate symbols for one price reader. Please use multiple price readers"
                                  " to read in different datasets of the same symbol.")
@@ -187,7 +228,9 @@ class PriceReader(__FormatReader):
 
         super().__init__(data_type)
 
-        if data_type == FileTypes.json.value:
+        if data_type == FileTypes.df.value:
+            self._parse_df_prices(file_paths, symbols, {'open', 'high', 'low', 'close', 'volume', 'time'})
+        elif data_type == FileTypes.json.value:
             self._parse_json_prices(file_paths, ('open', 'high', 'low', 'close', 'volume', 'time'))
         elif data_type == FileTypes.csv.value:
             self._parse_csv_prices(file_paths, symbols, {'open', 'high', 'low', 'close', 'volume', 'time'})
@@ -197,7 +240,15 @@ class PriceReader(__FormatReader):
         self._guess_resolutions()
 
 
-class EventReader(__DataReader):
+class EventReader(DataReader):
+    def __init__(self, event_type: str, events: dict):
+        super().__init__(DataTypes.event_json)
+        if events:
+            time, data = zip(*events.items())
+            self._write_dataset({'time': time, 'data': data}, event_type, ('time', 'data'))
+
+
+class JsonEventReader(DataReader):
     def __parse_json_events(self, file_path):
         contents = json.loads(open(file_path).read())
 
@@ -212,6 +263,13 @@ class EventReader(__DataReader):
             raise AssertionError(f"The filepath did not have a \'json\' ending - got: {file_path[-4:]}")
 
         self.__parse_json_events(file_path)
+
+
+class FundingRateEventReader(EventReader):
+    def __init__(self, symbol: str, start: int, stop: int, interface: FuturesExchangeInterface):
+        history = interface.get_funding_rate_history(symbol, start, stop)
+        history = {ev['time']: {'symbol': symbol, 'rate': ev['rate']} for ev in history}
+        super().__init__('__blankly__funding_rate', history)
 
 
 class TickReader(__FormatReader):

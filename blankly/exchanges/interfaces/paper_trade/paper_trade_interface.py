@@ -19,6 +19,7 @@
 import threading
 import time
 import traceback
+import warnings
 
 import blankly.exchanges.interfaces.paper_trade.utils as paper_trade
 import blankly.utils.utils as utils
@@ -28,6 +29,8 @@ from blankly.exchanges.interfaces.exchange_interface import ExchangeInterface
 from blankly.exchanges.interfaces.paper_trade.backtesting_wrapper import BacktestingWrapper
 from blankly.exchanges.orders.limit_order import LimitOrder
 from blankly.exchanges.orders.market_order import MarketOrder
+from blankly.exchanges.orders.stop_loss import StopLossOrder
+from blankly.exchanges.orders.take_profit import TakeProfitOrder
 from blankly.utils.exceptions import APIException, InvalidOrder
 
 
@@ -54,33 +57,55 @@ class PaperTradeInterface(ExchangeInterface, BacktestingWrapper):
         ExchangeInterface.__init__(self, derived_interface.get_exchange_type(), derived_interface)
         BacktestingWrapper.__init__(self)
 
-        # Write in the accounts to our local account. This involves getting the values directly from the exchange
-        accounts = self.calls.get_account()
-
-        # If it's given an initial account value dictionary, write all the account values that we passed in to the
-        # function to the account, then default everything else to zero.
-        if initial_account_values is not None:
-            for i in accounts.keys():
-                if i in initial_account_values.keys():
-                    accounts[i] = utils.AttributeDict({
-                        'available': initial_account_values[i],
-                        'hold': 0.0
-                    })
-                else:
-                    accounts[i] = utils.AttributeDict({
-                        'available': 0.0,
-                        'hold': 0.0
-                    })
-
-        # Initialize the local account
-        self.local_account = LocalAccount(accounts)
+        self.__local_account_cache = None
+        self.__initial_account_values = initial_account_values
 
         # Initialize our traded assets list
         self.traded_assets = []
 
-        self.evaluate_traded_account_assets()
+        # self.evaluate_traded_account_assets()
 
         self.__enable_shorting = self.user_preferences['settings']['alpaca']['enable_shorting']
+        self.__calculate_margin = self.user_preferences['settings']['simulate_margin']
+
+        # This logically overrides any __enable_shorting
+        self.__force_shorting = self.user_preferences['settings']['global_shorting']
+
+        if self.user_preferences['settings']['paper']['price_source'] == 'websocket':
+            from blankly.exchanges.managers.ticker_manager import TickerManager
+            warnings.warn("Experimental websocket prices enabled.")
+            self.__ticker_manager = TickerManager(self.get_exchange_type(), default_symbol='')
+            self._websocket_update = lambda *args: None
+
+    @property
+    def local_account(self):
+        if self.__local_account_cache is None:
+            if self.get_exchange_type() == 'keyless':
+                accounts = utils.add_all_products({}, self.get_products())
+            else:
+                # Write in the accounts to our local account. This involves getting the values directly from the
+                # exchange
+                accounts = self.calls.get_account()
+            # If it's given an initial account value dictionary, write all the account values that we passed in to the
+            # function to the account, then default everything else to zero.
+            if self.__initial_account_values is not None:
+                for i in accounts.keys():
+                    if i in self.__initial_account_values.keys():
+                        accounts[i] = utils.AttributeDict({
+                            'available': self.__initial_account_values[i],
+                            'hold': 0.0
+                        })
+                    else:
+                        accounts[i] = utils.AttributeDict({
+                            'available': 0.0,
+                            'hold': 0.0
+                        })
+
+            # Initialize the local account
+            self.__local_account_cache = LocalAccount(accounts)
+            return self.__local_account_cache
+        else:
+            return self.__local_account_cache
 
     def evaluate_traded_account_assets(self):
         # Because alpaca has so many columns we need to optimize to perform an accurate backtest
@@ -90,11 +115,15 @@ class PaperTradeInterface(ExchangeInterface, BacktestingWrapper):
             if (accounts[i]['available'] + accounts[i]['hold']) != 0 and i not in self.traded_assets:
                 self.traded_assets.append(i)
 
-    def is_backtesting(self):
+    def backtesting_time(self):
         """
         Return the backtest time if we're backtesting, if not just return None. If it's None the caller
          assumes no backtesting. The function being overridden always returns None
         """
+        # This is for the inits because it happens with both live calls and in the past
+        if self.initial_time is not None and not self.backtesting:
+            return self.initial_time
+        # This is for the actual price loops
         if self.backtesting:
             return self.time()
         else:
@@ -130,7 +159,7 @@ class PaperTradeInterface(ExchangeInterface, BacktestingWrapper):
         # TODO, this process could use variable update time/websocket usage, poll `time` and a variety of settings
         #  to create a robust trading system
         # Create the watchdog for watching limit orders
-        self.__thread = threading.Thread(target=self.__paper_trade_watchdog(), daemon=True)
+        self.__thread = threading.Thread(target=self.__paper_trade_watchdog, daemon=True)
         self.__thread.start()
         self.__run_watchdog = True
 
@@ -143,6 +172,7 @@ class PaperTradeInterface(ExchangeInterface, BacktestingWrapper):
         """
         Internal order watching system
         """
+        utils.info_print('Evaluating paper limit orders every 10 seconds...')
         while True:
             time.sleep(10)
             if not self.__run_watchdog:
@@ -220,8 +250,9 @@ class PaperTradeInterface(ExchangeInterface, BacktestingWrapper):
                 "settled": false
             }
             """
-            if index['type'] == 'limit' and index['status'] == 'pending':
+            if index['type'] in ('limit', 'stop_loss') and index['status'] == 'pending':
                 current_price = prices[index['symbol']]
+                limit_price = index['price']
 
                 if index['side'] == 'buy':
                     if index['price'] > current_price:
@@ -258,7 +289,8 @@ class PaperTradeInterface(ExchangeInterface, BacktestingWrapper):
 
                         self.paper_trade_orders[i] = order
                 elif index['side'] == 'sell':
-                    if index['price'] < prices[index['symbol']]:
+                    if limit_price < current_price and index['type'] == 'limit' \
+                            or current_price <= limit_price and index['type'] == 'stop_loss':
                         # Take everything off hold
 
                         asset_id = index['symbol']
@@ -325,16 +357,18 @@ class PaperTradeInterface(ExchangeInterface, BacktestingWrapper):
                 else:
                     raise KeyError("Symbol not found.")
 
+    def take_profit_order(self, symbol: str, price: float, size: float) -> TakeProfitOrder:
+        # we don't simulate partial fills, this is the same as take_profit
+        order = self.limit_order(symbol, 'sell', price, size)
+        return TakeProfitOrder(order._LimitOrder__order, order._LimitOrder__response, order.Interface)
+
+    def stop_loss_order(self, symbol: str, price: float, size: float):
+        return self.limit_order(symbol, 'sell', price, size, stop_loss=True)
+
     def market_order(self, symbol, side, size) -> MarketOrder:
         if not self.backtesting:
             print("Paper Trading...")
         needed = self.needed['market_order']
-        order = {
-            'size': size,
-            'side': side,
-            'symbol': symbol,
-            'type': 'market'
-        }
         creation_time = self.time()
         price = self.get_price(symbol)
         funds = price*size
@@ -355,7 +389,9 @@ class PaperTradeInterface(ExchangeInterface, BacktestingWrapper):
         base_decimals = self.__get_decimals(base_increment)
 
         # Test if funds has more decimals than the increment. The increment is the maximum resolution of the quote.
-        if self.__get_decimals(size) > base_decimals:
+        if self.should_auto_trunc:
+            size = utils.trunc(size, base_decimals)
+        elif self.__get_decimals(size) > base_decimals:
             raise InvalidOrder("Size resolution is too high, the highest resolution allowed for this symbol is: " +
                                str(base_increment) + ". You specified " + str(size) +
                                ". Try using blankly.trunc(size, decimal_number) to match the exchange resolution.")
@@ -368,11 +404,19 @@ class PaperTradeInterface(ExchangeInterface, BacktestingWrapper):
             shortable = False
             quantity_decimals = self.__get_decimals(market_limits['limit_order']['base_increment'])
 
+        order = {
+            'size': size,
+            'side': side,
+            'symbol': symbol,
+            'type': 'market'
+        }
         qty = size
 
         # Test the purchase
         self.local_account.test_trade(symbol, side, qty, price, market_limits['market_order']["quote_increment"],
-                                      quantity_decimals, (shortable and self.__enable_shorting))
+                                      quantity_decimals,
+                                      (shortable and self.__enable_shorting) or self.__force_shorting,
+                                      calculate_margin=self.__calculate_margin)
         # Create coinbase pro-like id
         coinbase_pro_id = paper_trade.generate_coinbase_pro_id()
         # TODO the force typing here isn't strictly necessary because its run int the isolate_specific anyway
@@ -438,7 +482,7 @@ class PaperTradeInterface(ExchangeInterface, BacktestingWrapper):
         })
         return MarketOrder(order, response, self)
 
-    def limit_order(self, symbol, side, price, size) -> LimitOrder:
+    def limit_order(self, symbol, side, price, size, stop_loss=False) -> LimitOrder:
         """
         Used for buying or selling limit orders
         Args:
@@ -472,7 +516,7 @@ class PaperTradeInterface(ExchangeInterface, BacktestingWrapper):
             'side': side,
             'price': price,
             'symbol': symbol,
-            'type': 'limit'
+            'type': 'stop_loss' if stop_loss else 'limit'
         }
         creation_time = self.time()
 
@@ -501,16 +545,28 @@ class PaperTradeInterface(ExchangeInterface, BacktestingWrapper):
         price_increment = order_filter['limit_order']['price_increment']
         price_increment_decimals = self.__get_decimals(price_increment)
 
-        if self.__get_decimals(price) > price_increment_decimals:
+        if self.should_auto_trunc:
+            price = utils.trunc(price, price_increment_decimals)
+        elif self.__get_decimals(price) > price_increment_decimals:
             raise InvalidOrder("Fund resolution is too high, minimum resolution is: " + str(price_increment) +
                                ". Try using blankly.trunc(size, decimal_number) to match the exchange resolution.")
 
         base_increment = order_filter['limit_order']['base_increment']
         base_decimals = self.__get_decimals(base_increment)
 
-        if self.__get_decimals(size) > base_decimals:
+        if self.should_auto_trunc:
+            size = utils.trunc(size, base_decimals)
+        elif self.__get_decimals(size) > base_decimals:
             raise InvalidOrder("Fund resolution is too high, minimum resolution is: " + str(base_increment) +
                                '. Try using blankly.trunc(size, decimal_number) to match the exchange resolution.')
+
+        order = {
+            'size': size,
+            'side': side,
+            'price': price,
+            'symbol': symbol,
+            'type': 'limit'
+        }
 
         # Test the trade
         self.local_account.test_trade(symbol, side, size, price, quote_resolution=price_increment_decimals,
@@ -529,7 +585,7 @@ class PaperTradeInterface(ExchangeInterface, BacktestingWrapper):
             'size': str(size),
             'status': 'pending',
             "time_in_force": "GTC",
-            'type': 'limit',
+            'type': 'stop_loss' if stop_loss else 'limit',
             'side': str(side),
             # 'stp': 'dc',
             # 'post_only': 'false',
@@ -565,7 +621,8 @@ class PaperTradeInterface(ExchangeInterface, BacktestingWrapper):
             self.local_account.update_hold(base, hold + size)
         else:
             raise APIException(f"Invalid side {side}")
-        return LimitOrder(order, response, self)
+        # TODO this is super stinky but refactoring this code is even stinkier
+        return StopLossOrder(order, response, self) if stop_loss else LimitOrder(order, response, self)
 
     def cancel_order(self, symbol, order_id) -> dict:
         """
@@ -633,12 +690,26 @@ class PaperTradeInterface(ExchangeInterface, BacktestingWrapper):
                 return i
 
     def get_products(self):
+        def get_keyless_products():
+            symbols_ = []
+            for full_symbol in self.full_prices:
+                symbols_.append({
+                    'symbol': full_symbol
+                })
+            self.get_products_cache = symbols_
         if self.backtesting:
             if self.get_products_cache is None:
-                self.get_products_cache = self.calls.get_products()
+                if self.get_exchange_type() == 'keyless':
+                    get_keyless_products()
+                else:
+                    self.get_products_cache = self.calls.get_products()
             return self.get_products_cache
         else:
-            return self.calls.get_products()
+            if self.get_exchange_type() == 'keyless':
+                get_keyless_products()
+                return self.get_products_cache
+            else:
+                return self.calls.get_products()
 
     def get_fees(self, symbol):
         if self.backtesting:
@@ -662,15 +733,7 @@ class PaperTradeInterface(ExchangeInterface, BacktestingWrapper):
 
     def get_product_history(self, symbol, epoch_start, epoch_stop, resolution):
         if self.backtesting:
-            if symbol in self.full_prices:
-                if resolution in self.full_prices[symbol]:
-                    price_set = self.full_prices[symbol][resolution]
-                else:
-                    raise LookupError(f"The resolution {resolution} not found or downloaded for {symbol}.")
-            else:
-                raise LookupError(f"Prices for this symbol ({symbol}) not found")
-
-            return utils.trim_df_time_column(price_set, epoch_start - resolution, epoch_stop)
+            return utils.extract_price_by_resolution(self.full_prices, symbol, epoch_start, epoch_stop, resolution)
         else:
             return self.calls.get_product_history(symbol, epoch_start, epoch_stop, resolution)
 
@@ -688,7 +751,26 @@ class PaperTradeInterface(ExchangeInterface, BacktestingWrapper):
         if self.backtesting:
             return self.get_backtesting_price(symbol)
         else:
-            return self.calls.get_price(symbol)
+            def idle(tick):
+                pass
+            # Only get crazy websocket prices if asked
+            if self.user_preferences['settings']['paper']['price_source'] == 'websocket':
+                tickers = self.__ticker_manager.get_all_tickers()
+                if self.get_exchange_type() in tickers and symbol in tickers[self.get_exchange_type()]:
+                    most_recent_tick = tickers[self.get_exchange_type()][symbol].get_most_recent_tick()
+
+                    if most_recent_tick is None:
+                        utils.info_print("No data found on ticker yet - using API...")
+                        return self.calls.get_price(symbol)
+                    else:
+                        return most_recent_tick['price']
+                else:
+                    utils.info_print(f"Creating ticker on symbol {symbol} for exchange {self.get_exchange_type()}...")
+                    self.__ticker_manager.create_ticker(callback=self._websocket_update, override_symbol=symbol,
+                                                        override_exchange=self.get_exchange_type())
+                    return self.calls.get_price(symbol)
+            else:
+                return self.calls.get_price(symbol)
 
     @staticmethod
     def __evaluate_binance_limits(price: (int, float), order_filter):

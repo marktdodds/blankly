@@ -6,6 +6,7 @@
    <img style="margin: 0 auto; padding-bottom: 15px; padding-top: 30px" width=70%" src="https://firebasestorage.googleapis.com/v0/b/blankly-6ada5.appspot.com/o/blankly-github-logo.png?alt=media&token=8f436cd2-3d28-432c-867a-afef780f4260">
 </div>
 <br />
+
 <div align="center">
   <b>💨  Rapidly build and deploy quantitative models for stocks, crypto, and forex  🚀</b>
 </div>
@@ -36,76 +37,80 @@
 
 ## Why Blankly? 
 
-​	Blankly is a live trading engine, backtest runner and development framework wrapped into one powerful open source package. Models can be instantly backtested, paper traded, sandbox tested and run live by simply changing a single line. We built blankly for every type of quant including training & running ML models in the same environment, cross-exchange/cross-symbol arbitrage, and even long/short positions on stocks (all with built-in websockets).
+Blankly is an ecosystem for algotraders enabling anyone to build, monetize and scale their trading algorithms for stocks, crypto, futures or forex. The same code can be backtested, paper traded, sandbox tested and run live by simply changing a single line. Develop locally then deploy, iterate and share using the blankly platform.
 
-​	Convert your existing model or build a new one - unlock the ability to run & optimize across all of our supported exchanges. Getting started is easy - just `pip install blankly` and `blankly init`.
+The blankly package is designed to be **extremely precise** in both simulation and live trading. **The engineering considerations for highly accurate simulation are described [here](blankly/BACKTESTING_ENGINEERING.md)**
 
-## Sponsored Promotion
-<a target="_blank" href="https://tokenbot.com/?utm_source=github&utm_medium=blankly&utm_campaign=algodevs"><img src="https://firebasestorage.googleapis.com/v0/b/blankly-6ada5.appspot.com/o/github%2FTokenBot-Blankly-banner.png?alt=media&token=843c16b0-da39-41a5-b34d-f7d5fdfdf088">
+Getting started is easy - just `pip install blankly` and `blankly init`.
 
 Check out our [website](https://blankly.finance) and our [docs](https://docs.blankly.finance).
 
-[YouTube - Under 25 Lines Build an Alpaca RSI Trading Bot](https://youtu.be/pcm0h63rhUU)
-<a target="_blank" href="https://youtu.be/pcm0h63rhUU"><img src="https://firebasestorage.googleapis.com/v0/b/blankly-6ada5.appspot.com/o/github%2Fbuild_a_bot_readme_thumbnail.jpg?alt=media&token=a9dd030a-805c-447f-a970-2bc8e1815662" style="border-radius:10px"></a>
+<div align="center">
+<a target="_blank" href="https://youtu.be/pcm0h63rhUU"><img src="https://firebasestorage.googleapis.com/v0/b/blankly-6ada5.appspot.com/o/github%2Fbuild_a_bot_readme_thumbnail.jpg?alt=media&token=a9dd030a-805c-447f-a970-2bc8e1815662" style="border-radius:10px; width: 50%"></a>
+</div>
 
-### Trade Stocks, Crypto, and Forex Seamlessly
+---------
+
+### Trade Stocks, Crypto, Futures, and Forex
 
 ```python
 from blankly import Alpaca, CoinbasePro
 
 stocks = Alpaca()
 crypto = CoinbasePro()
+futures = BinanceFutures()
 
 # Easily perform the same actions across exchanges & asset types
 stocks.interface.market_order('AAPL', 'buy', 1)
 crypto.interface.market_order('BTC-USD', 'buy', 1)
+# Full futures feature set
+futures.interface.get_hedge_mode()
 ```
 
-### Backtest Instantly Across Symbols
+### Backtest your trades, events, websockets, and custom data
 
 ```python
-from blankly import Alpaca, Strategy, StrategyState
+import blankly
+"""
+This example shows how backtest over tweets
+"""
+
+class TwitterBot(blankly.Model):
+    def main(self, args):
+        while self.has_data:
+            self.backtester.value_account()
+            self.sleep('1h')
+
+    def event(self, type_: str, data: str):
+        # Now check if it's a tweet about Tesla
+        if 'tsla' in data.lower() or 'gme' in data.lower():
+            # Buy, sell or evaluate your portfolio
+            pass
 
 
-def price_event(price, symbol, state):
-    # Trading logic here
-    state.interface.market_order(symbol, 'buy', 1)
+if __name__ == "__main__":
+    exchange = blankly.Alpaca()
+    model = TwitterBot(exchange)
 
+    # Add the tweets json here
+    model.backtester.add_custom_events(blankly.data.JsonEventReader('./tweets.json'))
+    # Now add some underlying prices at 1 month
+    model.backtester.add_prices('TSLA', '1h', start_date='3/20/22', stop_date='4/15/22')
 
-# Authenticate
-alpaca = Alpaca()
-strategy = Strategy(alpaca)
+    # Backtest or run live
+    print(model.backtest(args=None, initial_values={'USD': 10000}))
 
-# Check price every hour and send to the strategy function
-# Easily switch resolutions and data
-strategy.add_price_event(price_event, 'AAPL', '1h')
-strategy.add_price_event(price_event, 'MSFT', '15m')
-
-# Run the backtest
-strategy.backtest(to='1y')
 ```
+
+**Check out alternative data examples [here](https://docs.blankly.finance/examples/model-framework)**
 
 #### Accurate Backtest Holdings
 
 <div align="center">
-    <a><img src="https://firebasestorage.googleapis.com/v0/b/blankly-6ada5.appspot.com/o/github%2Fscreely-1631725027541.jpg?alt=media&token=fa8daa96-9d7f-44f9-b8fd-2a6dcdab2877" style="border-radius:10px"></a>
+    <a><img src="https://firebasestorage.googleapis.com/v0/b/blankly-6ada5.appspot.com/o/github%2FScreen%20Shot%202022-04-17%20at%202.37.58%20PM.png?alt=media&token=d5738617-e197-4da2-850d-8fbbfda05275" style="border-radius:10px"></a>
 </div>
 
-#### Useful Metrics
 
-```bash
-Blankly Metrics: 
-Compound Annual Growth Rate (%):   54.0%
-Cumulative Returns (%):            136.0%
-Max Drawdown (%):                  60.0%
-Variance (%):                      26.15%
-Sortino Ratio:                     0.9
-Sharpe Ratio:                      0.73
-Calmar Ratio:                      0.99
-Volatility:                        0.05
-Value-at-Risk:                     358.25
-Conditional Value-at-Risk:         34.16
-```
 ### Go Live in One Line
 
 Seamlessly run your model live!
@@ -139,7 +144,7 @@ The command will create the files `keys.json`, `settings.json`, `backtest.json`,
 
 If you don't want to use our `init` command, you can find the same files in the `examples` folder under [`settings.json`](https://github.com/Blankly-Finance/Blankly/blob/main/examples/settings.json) and [`keys_example.json`](https://github.com/Blankly-Finance/Blankly/blob/main/examples/keys_example.json)
 
-3. From there, **insert your API keys** from your exchange into the generated `keys.json` file.
+3. From there, **insert your API keys** from your exchange into the generated `keys.json` file or take advantage of the CLI keys prompt.
 
 More information can be found on our [docs](https://docs.blankly.finance)
 
@@ -147,7 +152,7 @@ More information can be found on our [docs](https://docs.blankly.finance)
 
 The working directory format should have *at least* these files:
 ```
-Project
+project/
    |-bot.py
    |-keys.json
    |-settings.json
@@ -171,9 +176,12 @@ For more info, and ways to do more advanced things, check out our [getting start
 | Coinbase Pro        | 🟢           | 🟢          | 🟢           | 🟢           |
 | Binance             | 🟢           | 🟢          | 🟢           | 🟢           |
 | Alpaca              | 🟢           | 🟢          | 🟢           | 🟢           |
-| OANDA               | 🟢           | 🟡          | 🟢           | 🟢           |
+| OANDA               | 🟢           |  | 🟢           | 🟢           |
 | FTX                 | 🟢           | 🟢          | 🟢           | 🟢           |
-| KuCoin              | 🟢           | 🟡          | 🟢           | 🟢           |
+| KuCoin              | 🟢           | 🟢        | 🟢           | 🟢           |
+| Binance Futures | 🟢 | 🟢 | 🟢 | 🟢 |
+| FTX Futures | 🟡 | 🟡 | 🟢 | 🟢 |
+| Okx | 🟢 | 🟢 | 🟢 | 🟢 |
 | Kraken              | 🟡           | 🟡          | 🟡           | 🟡           |
 | Keyless Backtesting |              |            |              | 🟢           |
 | TD Ameritrade       | 🔴           | 🔴          | 🔴           | 🔴           |
@@ -191,53 +199,7 @@ For more info, and ways to do more advanced things, check out our [getting start
 
 We have a pre-built cookbook examples that implement strategies such as RSI, MACD, and the Golden Cross found in our [examples](https://docs.blankly.finance/examples/golden-cross).
 
-The model below will run an RSI check every 30 minutes - **buying** below **30** and **selling** above **70**. Try switching the exchange and assets and see how it instantly works on Binance, Coinbase Pro or anything else you trade on.
-
-```python
-import blankly
-from blankly import StrategyState
-
-
-def price_event(price, symbol, state: StrategyState):
-    """ This function will give an updated price every 15 seconds from our definition below """
-    state.variables['history'].append(price)
-    rsi = blankly.indicators.rsi(state.variables['history'])
-    
-    if rsi[-1] < 30 and not state.variables['has_bought']:
-        # Dollar cost average buy
-        state.variables['has_bought'] = True
-        state.interface.market_order(symbol, side='buy', size=1)
-    elif rsi[-1] > 70 and state.variables['has_bought']:
-        # Dollar cost average sell
-        state.variables['has_bought'] = False
-        state.interface.market_order(symbol, side='sell', size=1)
-
-
-def init(symbol, state: StrategyState):
-    # Download price data to give context to the algo
-    state.variables['history'] = state.interface.history(symbol, to='1y', return_as='list')['open']
-    state.variables['has_bought'] = False
-
-
-if __name__ == "__main__":
-    # Authenticate on alpaca to create a strategy
-    alpaca = blankly.Alpaca()
-
-    # Use our strategy helper on alpaca
-    strategy = blankly.Strategy(alpaca)
-
-    # Run the price event function every time we check for a new price - by default that is 15 seconds
-    strategy.add_price_event(price_event, symbol='NCLH', resolution='30m', init=init)
-    strategy.add_price_event(price_event, symbol='CRBP', resolution='1h', init=init)
-    strategy.add_price_event(price_event, symbol='D', resolution='15m', init=init)
-    strategy.add_price_event(price_event, symbol='GME', resolution='30m', init=init)
-
-    # Start the strategy. This will begin each of the price event ticks
-    # strategy.start()
-    # Or backtest using this
-    strategy.backtest(to='1y')
-```
-## Other Info
+Other Info
 
 ### Subscribe to our news!
 https://blankly.substack.com/p/coming-soon
@@ -254,10 +216,14 @@ This is free software.
 ### Contributing
 
 If you would like to support the project, pull requests are welcome.
-You can also contribute just by telling us what you think of Blankly: https://forms.gle/4oAjG9MKRTYKX2hP9
 
 ### Licensing 
 
 **Blankly** is distributed under the [**LGPL License**](https://www.gnu.org/licenses/lgpl-3.0.en.html). See the [LICENSE](/LICENSE) for more details.
 
 New updates every day 💪.
+
+<div align="center">
+    <img src="https://firebasestorage.googleapis.com/v0/b/blankly-6ada5.appspot.com/o/github%2Fblanklybots.png?alt=media&token=005728b0-5f49-476d-968a-07fe0683ca09" style="border-radius:10px; width: 30%">
+</div>
+Art by DALL·E 2 - "Robots playfully trading stocks synthwave"
